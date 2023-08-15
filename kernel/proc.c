@@ -29,8 +29,8 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
-      initlock(&p->lock, "proc");
-
+      initlock(&p->lock, "proc");}
+  /*lab3-2
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
@@ -40,7 +40,7 @@ procinit(void)
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
       p->kstack = va;
-  }
+  }*/
   kvminithart();
 }
 
@@ -120,6 +120,21 @@ found:
     release(&p->lock);
     return 0;
   }
+  // process's kernel page table - lab3-2
+  p->kernel_pgtbl = proc_kpagetable(p);
+  if (p->kernel_pgtbl == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }  
+
+  char *pa = kalloc();    // 分配页面
+  if(pa == 0) {
+    panic("kalloc");
+  }
+  uint64 va = KSTACK((int)(p-proc));
+  uvmmap(p->kernel_pgtbl, va, (uint64)pa,PGSIZE,PTE_R | PTE_W);
+  p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -149,6 +164,11 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+   // lab3-2
+  uvmunmap(p->kernel_pgtbl, p->kstack, 1, 1);
+  p->kstack = 0;
+  proc_freekernel_pgtbl(p->kernel_pgtbl);
+  p->kernel_pgtbl=0;
   p->state = UNUSED;
 }
 
@@ -220,7 +240,8 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
-
+  // init kernel pagetable - lab3-3
+  u2kvmcopy(p->pagetable, p->kernel_pgtbl, 0, p->sz);
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -233,6 +254,7 @@ userinit(void)
   release(&p->lock);
 }
 
+
 // Grow or shrink user memory by n bytes.
 // Return 0 on success, -1 on failure.
 int
@@ -243,11 +265,24 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    // lab3-3
+    if(sz + n > PLIC){
+      return -1;
+    }
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+      return -1;
+    }
+
+    if(u2kvmcopy(p->pagetable, p->kernel_pgtbl, p->sz, sz) < 0){
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+
+    if (PGROUNDUP(sz) < PGROUNDUP(p->sz)) {
+      uvmunmap(p->kernel_pgtbl, PGROUNDUP(sz),
+               (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
+    }
   }
   p->sz = sz;
   return 0;
@@ -275,6 +310,12 @@ fork(void)
   }
   np->sz = p->sz;
 
+  // lab3-3
+  if(u2kvmcopy(np->pagetable, np->kernel_pgtbl, 0, np->sz) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
   np->parent = p;
 
   // copy saved user registers.
@@ -473,8 +514,14 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+       
+        // lab3-2 加载进程内核页表
+        w_satp(MAKE_SATP(p->kernel_pgtbl));
+        // lab3-2 空置TLB
+        sfence_vma();
         swtch(&c->context, &p->context);
 
+        kvminithart();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
@@ -696,4 +743,18 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+// lab3-2
+void proc_freekernel_pgtbl(pagetable_t kernel_pgtbl) {
+    for(int i = 0; i < 512; i++){
+        pte_t pte = kernel_pgtbl[i];
+        if((pte & PTE_V)){
+            kernel_pgtbl[i] = 0;
+            if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+                uint64 child = PTE2PA(pte);
+                proc_freekernel_pgtbl((pagetable_t)child);
+            }
+        }
+    }
+    kfree((void*)kernel_pgtbl);
 }

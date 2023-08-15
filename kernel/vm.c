@@ -126,7 +126,7 @@ kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
 // addresses on the stack.
 // assumes va is page aligned.
 uint64
-kvmpa(uint64 va)
+kvmpa(pagetable_t kernel_pagetable,uint64 va)
 {
   uint64 off = va % PGSIZE;
   pte_t *pte;
@@ -372,7 +372,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   }
   return 0;
 }
-
+/*
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
@@ -439,4 +439,93 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}*/
+
+  // lab3-1
+void vmprinthelper(pagetable_t pagetable, int level) {
+    for (int i = 0; i < 512; ++i) {
+        pte_t pte = pagetable[i];
+        // PTE是否有效
+        if (pte & PTE_V) {
+            switch(level)
+            {
+                case 3:
+                    printf(".. ");
+                case 2:
+                    printf(".. ");
+                case 1:
+                    printf("..%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+            }
+            pagetable_t child = (pagetable_t) PTE2PA(pte);
+            // 是否不为最低级页目录
+            if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+                vmprinthelper(child, level + 1);
+            }
+        }
+    }
+}
+
+void vmprint(pagetable_t pagetable) {
+    printf("page table %p\n", pagetable);
+    vmprinthelper(pagetable,1);
+}
+
+// lab3-2
+pagetable_t proc_kpagetable(struct proc *p) {
+
+    pagetable_t kpagetable = uvmcreate();
+    if(kpagetable == 0){
+        return 0;
+    }
+    uvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+    uvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+    //uvmmap(kpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+    uvmmap(kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+    uvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+    uvmmap(kpagetable, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+    uvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X); 
+    return kpagetable;
+}
+
+void uvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm) {
+    if(mappages(pagetable, va, sz, pa, perm) != 0) {
+        panic("uvmmap");
+    }
+}
+
+// lab3-3
+int u2kvmcopy(pagetable_t upagetable, pagetable_t kpagetable, uint64 begin, uint64 end) {
+    pte_t *pte;
+    uint64 pa, i;
+    uint flags;
+    uint64 begin_page = PGROUNDUP(begin);    // 向上取整
+    for(i = begin_page; i < end; i += PGSIZE){
+        if((pte = walk(upagetable, i, 0)) == 0)
+            panic("uvmcopy2kvm: pte should exist");
+        if((*pte & PTE_V) == 0)
+            panic("uvmcopy2kvm: page not present");
+        pa = PTE2PA(*pte);
+        flags = PTE_FLAGS(*pte) & (~PTE_U); // clear PTE_U flag
+        // map to the physical memory same as user's pa instead of kalloc()
+        if(mappages(kpagetable, i, PGSIZE, pa, flags) != 0){
+            goto err;
+        }
+    }
+    return 0;
+
+err:
+    uvmunmap(kpagetable, begin_page, (i- begin_page) / PGSIZE, 0);
+    return -1;
+}
+
+int
+copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+{
+    return copyin_new(pagetable, dst, srcva, len);
+}
+
+int
+copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+{
+    return copyinstr_new(pagetable, dst, srcva, max);
 }
